@@ -50,6 +50,13 @@ The key objectives of this project are:
 - **Peer‑to‑Peer Communication:** Bluetooth Low Energy (BLE) and / or Wi‑Fi Direct via third‑party SDK
 - **Target Devices:** Android mobile devices (physical devices used for testing)
 
+### Third-Party Libraries
+
+- **flutter_blue_plus (2.2.1):** Used for Bluetooth Low Energy scanning and peer discovery to support nearby node awareness.
+- **permission_handler (12.0.1):** Used to request and manage runtime permissions required for BLE and related device capabilities.
+- **cupertino_icons (1.0.8):** Standard icon package used by Flutter for iOS-style icons where needed.
+- **flutter_lints (6.0.0, dev dependency):** Lint rule set used during development for code quality and consistency.
+
 ### Architecture Summary
 - Devices continuously monitor both internet connectivity and nearby peers.
 - When internet connectivity is lost, the application automatically switches to **MANET mode**.
