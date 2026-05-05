@@ -52,13 +52,18 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
   final String nodeId = "NODE-${DateTime.now().millisecondsSinceEpoch}";
   final Strategy nearbyStrategy = Strategy.P2P_CLUSTER;
   final Nearby nearby = Nearby();
-  final DateTime metricsStartedAt = DateTime.now();
+  DateTime metricsStartedAt = DateTime.now();
 
   StreamSubscription<List<ScanResult>>? scanResultsSubscription;
+  Timer? hybridMonitorTimer;
   Timer? queuedSendRetryTimer;
   String? queuedAlertMessage;
   bool isRecoveringNearby = false;
   bool alertChannelReady = false;
+  bool internetReachable = false;
+  bool meshFailoverActive = false;
+  String hybridModeText = "HYBRID: CHECKING...";
+  Color hybridModeColor = Colors.grey;
   final Map<String, DateTime> connectionAttempts = <String, DateTime>{};
   final List<int> handshakeSamplesMs = <int>[];
   final List<int> latencySamplesMs = <int>[];
@@ -95,6 +100,7 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     // Nearby Connections in this prototype is Android-only.
     if (!kIsWeb && Platform.isAndroid) {
       initializeAlertChannel();
+      startHybridMonitoring();
     } else {
       addLog("Offline alert channel is only configured for Android devices");
     }
@@ -111,6 +117,56 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
         scanLogs.removeLast();
       }
     });
+  }
+
+  Future<bool> probeInternetReachability() async {
+    try {
+      final List<InternetAddress> lookupResult = await InternetAddress.lookup(
+        "example.com",
+      ).timeout(const Duration(seconds: 3));
+      return lookupResult.isNotEmpty &&
+          lookupResult.first.rawAddress.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> startHybridMonitoring() async {
+    await refreshHybridConnectivity(forceLog: true);
+
+    hybridMonitorTimer?.cancel();
+    hybridMonitorTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      refreshHybridConnectivity();
+    });
+  }
+
+  Future<void> refreshHybridConnectivity({bool forceLog = false}) async {
+    final bool internetNow = await probeInternetReachability();
+    if (!mounted) {
+      return;
+    }
+
+    final bool shouldUpdate = forceLog || internetNow != internetReachable;
+    if (!shouldUpdate) {
+      return;
+    }
+
+    setState(() {
+      internetReachable = internetNow;
+      meshFailoverActive = !internetNow;
+      hybridModeText = internetNow
+          ? "HYBRID: CLOUD PREFERRED"
+          : "HYBRID: MANET FAILOVER ACTIVE";
+      hybridModeColor = internetNow
+          ? Colors.lightBlueAccent
+          : Colors.orangeAccent;
+    });
+
+    if (internetNow) {
+      addLog("Internet reachable. Cloud path is preferred, mesh stays ready.");
+    } else {
+      addLog("Internet unavailable. Switching to MANET failover mode.");
+    }
   }
 
   void recordHandshakeSample(String endpointId) {
@@ -161,6 +217,23 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     return "${ratio.toStringAsFixed(1)}% ($received/$sent)";
   }
 
+  String formatAlertEntry({
+    required String senderId,
+    required String sentAt,
+    required String message,
+    required int hopCount,
+    required List<String> forwardedBy,
+    required bool isLocalOrigin,
+  }) {
+    final String pathText = forwardedBy.isEmpty
+        ? senderId
+        : forwardedBy.join(" → ");
+    final String routeLabel = isLocalOrigin ? "Origin" : "Forwarded";
+    final String hopText = hopCount > 0 ? " • Hops: $pathText → $nodeId" : "";
+
+    return "$routeLabel • $senderId • $sentAt\n$message$hopText";
+  }
+
   double trafficRateKbps() {
     final Duration elapsed = DateTime.now().difference(metricsStartedAt);
     if (elapsed.inMilliseconds <= 0) {
@@ -171,10 +244,28 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     return (totalBytes * 8) / elapsed.inMilliseconds;
   }
 
+  void resetEvaluationMetrics() {
+    setState(() {
+      metricsStartedAt = DateTime.now();
+      connectionAttempts.clear();
+      handshakeSamplesMs.clear();
+      latencySamplesMs.clear();
+      originatedAlertCount = 0;
+      forwardedAlertCount = 0;
+      uniqueAlertCount = 0;
+      duplicateAlertCount = 0;
+      sentBytesTotal = 0;
+      receivedBytesTotal = 0;
+    });
+
+    addLog("Evaluation metrics reset for a fresh test run");
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && !kIsWeb && Platform.isAndroid) {
       addLog("App resumed. Re-checking nearby channel state.");
+      refreshHybridConnectivity();
       recoverNearbyChannel(reason: "app resumed");
     }
   }
@@ -406,12 +497,17 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
           final String displayHops = hopCount > 0
               ? " (Hops: $hopChain → $nodeId)"
               : "";
+          final String feedEntry = formatAlertEntry(
+            senderId: senderId,
+            sentAt: sentAt,
+            message: message,
+            hopCount: hopCount,
+            forwardedBy: forwardedBy,
+            isLocalOrigin: false,
+          );
 
           setState(() {
-            receivedAlerts.insert(
-              0,
-              "$senderId @ $sentAt -> $message$displayHops",
-            );
+            receivedAlerts.insert(0, feedEntry);
             if (receivedAlerts.length > 15) {
               receivedAlerts.removeLast();
             }
@@ -593,6 +689,14 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     seenAlertIds.add(alertId);
     originatedAlertCount += 1;
     sentBytesTotal += bytes.length;
+    final String feedEntry = formatAlertEntry(
+      senderId: nodeId,
+      sentAt: sentAt,
+      message: message,
+      hopCount: 0,
+      forwardedBy: <String>[nodeId],
+      isLocalOrigin: true,
+    );
 
     // Send to all connected peers (they may forward this further).
     for (final String endpointId in List<String>.from(
@@ -602,7 +706,7 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     }
 
     setState(() {
-      receivedAlerts.insert(0, "YOU @ $sentAt -> $message");
+      receivedAlerts.insert(0, feedEntry);
       if (receivedAlerts.length > 15) {
         receivedAlerts.removeLast();
       }
@@ -632,6 +736,7 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     scanResultsSubscription?.cancel();
+    hybridMonitorTimer?.cancel();
     queuedSendRetryTimer?.cancel();
     nearby.stopAdvertising();
     nearby.stopDiscovery();
@@ -722,6 +827,44 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 12),
             const Text(
+              "Hybrid Status",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white10,
+                border: Border.all(color: Colors.white24),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    hybridModeText,
+                    style: TextStyle(
+                      color: hybridModeColor,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    internetReachable
+                        ? "Cloud link: available"
+                        : "Cloud link: unavailable",
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  Text(
+                    meshFailoverActive
+                        ? "MANET failover: active"
+                        : "MANET failover: standby",
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
               "Evaluation Metrics",
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
@@ -755,6 +898,15 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
                   Text(
                     "Forwarded alerts: $forwardedAlertCount • Duplicates dropped: $duplicateAlertCount",
                     style: const TextStyle(color: Colors.white70),
+                  ),
+                  const SizedBox(height: 10),
+                  OutlinedButton(
+                    onPressed: resetEvaluationMetrics,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white38),
+                    ),
+                    child: const Text("Reset evaluation metrics"),
                   ),
                 ],
               ),
