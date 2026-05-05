@@ -5,7 +5,6 @@
 // gestures. You can also use WidgetTester to find child widgets in the widget
 // tree, read text, and verify that the values of widget properties are correct.
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:portonian_push/main.dart';
@@ -18,6 +17,9 @@ void main() {
 
     expect(find.text('PORTONIAN PUSH'), findsOneWidget);
     expect(find.text('ACTIVATE BEACON'), findsOneWidget);
+    expect(find.text('SEND ALERT'), findsOneWidget);
+    expect(find.text('Basic Alert Transfer'), findsOneWidget);
+    expect(find.text('Alert Feed'), findsOneWidget);
     expect(find.text('Discovered Devices'), findsOneWidget);
     expect(find.text('Scan Log'), findsOneWidget);
   });
