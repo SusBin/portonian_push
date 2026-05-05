@@ -52,12 +52,22 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
   final String nodeId = "NODE-${DateTime.now().millisecondsSinceEpoch}";
   final Strategy nearbyStrategy = Strategy.P2P_CLUSTER;
   final Nearby nearby = Nearby();
+  final DateTime metricsStartedAt = DateTime.now();
 
   StreamSubscription<List<ScanResult>>? scanResultsSubscription;
   Timer? queuedSendRetryTimer;
   String? queuedAlertMessage;
   bool isRecoveringNearby = false;
   bool alertChannelReady = false;
+  final Map<String, DateTime> connectionAttempts = <String, DateTime>{};
+  final List<int> handshakeSamplesMs = <int>[];
+  final List<int> latencySamplesMs = <int>[];
+  int originatedAlertCount = 0;
+  int forwardedAlertCount = 0;
+  int uniqueAlertCount = 0;
+  int duplicateAlertCount = 0;
+  int sentBytesTotal = 0;
+  int receivedBytesTotal = 0;
 
   @override
   void initState() {
@@ -101,6 +111,64 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
         scanLogs.removeLast();
       }
     });
+  }
+
+  void recordHandshakeSample(String endpointId) {
+    final DateTime? startedAt = connectionAttempts.remove(endpointId);
+    if (startedAt == null) {
+      return;
+    }
+
+    final int handshakeMs = DateTime.now().difference(startedAt).inMilliseconds;
+    handshakeSamplesMs.add(handshakeMs);
+    if (handshakeSamplesMs.length > 10) {
+      handshakeSamplesMs.removeAt(0);
+    }
+
+    addLog("Observed handshake for $endpointId: ${handshakeMs}ms");
+  }
+
+  void recordLatencySample(String sentAtIso) {
+    try {
+      final DateTime sentAt = DateTime.parse(sentAtIso);
+      final int latencyMs = DateTime.now().difference(sentAt).inMilliseconds;
+      latencySamplesMs.add(latencyMs);
+      if (latencySamplesMs.length > 10) {
+        latencySamplesMs.removeAt(0);
+      }
+
+      addLog("Observed end-to-end latency: ${latencyMs}ms");
+    } catch (_) {
+      addLog("Latency sample skipped: bad sentAt timestamp");
+    }
+  }
+
+  String averageSampleText(List<int> samples) {
+    if (samples.isEmpty) {
+      return "--";
+    }
+
+    final double average = samples.reduce((a, b) => a + b) / samples.length;
+    return "${average.toStringAsFixed(0)}ms";
+  }
+
+  String formatRatio(int received, int sent) {
+    if (sent == 0) {
+      return "--";
+    }
+
+    final double ratio = (received / sent) * 100;
+    return "${ratio.toStringAsFixed(1)}% ($received/$sent)";
+  }
+
+  double trafficRateKbps() {
+    final Duration elapsed = DateTime.now().difference(metricsStartedAt);
+    if (elapsed.inMilliseconds <= 0) {
+      return 0;
+    }
+
+    final int totalBytes = sentBytesTotal + receivedBytesTotal;
+    return (totalBytes * 8) / elapsed.inMilliseconds;
   }
 
   @override
@@ -275,7 +343,8 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
   }
 
   void onConnectionInit(String endpointId, ConnectionInfo info) {
-    // auto-accept here to keep testing simple but in a real app ask user about each connection.
+    // Auto-accept here to keep testing simple. In a real app, we'd ask the user
+    // about each incoming connection for security.
     setState(() {
       connectedEndpoints[endpointId] = info;
       pendingConnectionIds.remove(endpointId);
@@ -303,21 +372,54 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
               alertPayload["message"] as String? ?? "(empty message)";
           final String sentAt =
               alertPayload["sentAt"] as String? ?? "unknown time";
+          final int hopCount = alertPayload["hopCount"] as int? ?? 0;
+          final List<dynamic> forwardedByList =
+              alertPayload["forwardedBy"] as List<dynamic>? ?? <dynamic>[];
+          final List<String> forwardedBy = forwardedByList
+              .map((e) => e.toString())
+              .toList();
 
+          receivedBytesTotal += payload.bytes?.length ?? 0;
+
+          // Ignore if this alert originated from us (senderId == nodeId) or we've already seen it.
           if (senderId == nodeId || seenAlertIds.contains(alertId)) {
+            if (seenAlertIds.contains(alertId)) {
+              duplicateAlertCount += 1;
+            }
             return;
           }
 
           seenAlertIds.add(alertId);
+          uniqueAlertCount += 1;
+          recordLatencySample(sentAt);
+
+          // This is a new alert we haven't seen before. Now we make the multi-hop decision:
+          // If this alert came from a direct peer and we have other connections,
+          // we forward it along so it can reach devices further away. This is how A→B→C propagation works.
+          forwardAlertToOtherPeers(alertPayload, endpointId);
+
+          // Display the alert on screen. We show the forwarding chain so users can see
+          // the path the alert took to reach them (e.g., "Hops: Original → Node-B → Node-C").
+          final String hopChain = forwardedBy.isNotEmpty
+              ? forwardedBy.join(" → ")
+              : senderId;
+          final String displayHops = hopCount > 0
+              ? " (Hops: $hopChain → $nodeId)"
+              : "";
 
           setState(() {
-            receivedAlerts.insert(0, "$senderId @ $sentAt -> $message");
+            receivedAlerts.insert(
+              0,
+              "$senderId @ $sentAt -> $message$displayHops",
+            );
             if (receivedAlerts.length > 15) {
               receivedAlerts.removeLast();
             }
           });
 
-          addLog("Alert received from $senderId");
+          addLog(
+            "Alert received from $senderId (hop $hopCount, routed through: ${forwardedBy.join(', ')})",
+          );
         } catch (_) {
           addLog("Ignored non-alert nearby payload");
         }
@@ -326,10 +428,62 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     );
   }
 
+  // This method is responsible for multi-hop forwarding. When we receive a new alert,
+  // we pass it along to all our OTHER connected peers (not back to the sender).
+  // This creates the mesh propagation: A sends to B, B forwards to C, even if A and C aren't direct neighbors.
+  Future<void> forwardAlertToOtherPeers(
+    Map<String, dynamic> originalPayload,
+    String senderEndpointId,
+  ) async {
+    // Make a copy of the original payload so we don't modify it.
+    // We'll update the hop count and forwarding chain to reflect our role in passing it along.
+    final Map<String, dynamic> forwardedPayload = Map<String, dynamic>.from(
+      originalPayload,
+    );
+
+    // Increment the hop count by 1 (we're one more node in the chain now).
+    final int currentHopCount = forwardedPayload["hopCount"] as int? ?? 0;
+    forwardedPayload["hopCount"] = currentHopCount + 1;
+
+    // Add ourselves to the forwarding chain so other nodes know which path this took.
+    final List<dynamic> existingPath =
+        forwardedPayload["forwardedBy"] as List<dynamic>? ?? <dynamic>[];
+    final List<String> updatedPath = existingPath
+        .map((e) => e.toString())
+        .toList();
+    updatedPath.add(nodeId);
+    forwardedPayload["forwardedBy"] = updatedPath;
+
+    final Uint8List forwardBytes = Uint8List.fromList(
+      utf8.encode(jsonEncode(forwardedPayload)),
+    );
+
+    // Send to all connected peers EXCEPT the one we received it from
+    // (no point sending it back to where it came from).
+    for (final String endpointId in List<String>.from(
+      connectedEndpoints.keys,
+    )) {
+      if (endpointId != senderEndpointId) {
+        try {
+          forwardedAlertCount += 1;
+          sentBytesTotal += forwardBytes.length;
+          await nearby.sendBytesPayload(endpointId, forwardBytes);
+        } catch (e) {
+          addLog("Failed to forward alert to $endpointId: $e");
+        }
+      }
+    }
+
+    addLog(
+      "Alert forwarded to ${connectedEndpoints.length - 1} peer(s) (hop count now: ${forwardedPayload["hopCount"]})",
+    );
+  }
+
   void onConnectionResult(String endpointId, Status status) {
     addLog("Connection result for $endpointId: $status");
 
     if (status == Status.CONNECTED) {
+      recordHandshakeSample(endpointId);
       setState(() {
         alertChannelReady = true;
       });
@@ -343,6 +497,8 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
       connectedEndpoints.remove(endpointId);
       pendingConnectionIds.remove(endpointId);
     });
+
+    connectionAttempts.remove(endpointId);
 
     addLog("Disconnected from endpoint $endpointId");
     recoverNearbyChannel(reason: "endpoint disconnected");
@@ -359,6 +515,7 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     }
 
     pendingConnectionIds.add(endpointId);
+    connectionAttempts[endpointId] = DateTime.now();
     addLog("Endpoint found: $endpointName ($endpointId)");
 
     try {
@@ -417,18 +574,27 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     final String alertId = "${nodeId}_${DateTime.now().millisecondsSinceEpoch}";
     final String sentAt = DateTime.now().toIso8601String();
 
+    // Build the alert payload. This includes the hop tracking info so that peers
+    // can understand the forwarding chain (A → B → C) and avoid sending back to sender.
+    // hopCount tracks how many times this alert has been forwarded.
+    // forwardedBy lists all nodes in the path so far (starting with the original sender).
     final Map<String, dynamic> payload = <String, dynamic>{
       "alertId": alertId,
       "senderId": nodeId,
       "sentAt": sentAt,
       "message": message,
+      "hopCount": 0, // We're the originator, so no hops yet.
+      "forwardedBy": <String>[nodeId], // Start with this device in the chain.
     };
 
     final Uint8List bytes = Uint8List.fromList(
       utf8.encode(jsonEncode(payload)),
     );
     seenAlertIds.add(alertId);
+    originatedAlertCount += 1;
+    sentBytesTotal += bytes.length;
 
+    // Send to all connected peers (they may forward this further).
     for (final String endpointId in List<String>.from(
       connectedEndpoints.keys,
     )) {
@@ -553,6 +719,45 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
             Text(
               "Connected peers: ${connectedEndpoints.length}",
               style: const TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              "Evaluation Metrics",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white10,
+                border: Border.all(color: Colors.white24),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Observed handshake time: ${averageSampleText(handshakeSamplesMs)}",
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  Text(
+                    "Observed end-to-end latency: ${averageSampleText(latencySamplesMs)}",
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  Text(
+                    "Measured packet delivery ratio: ${formatRatio(uniqueAlertCount, originatedAlertCount)}",
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  Text(
+                    "Estimated throughput: ${trafficRateKbps().toStringAsFixed(2)} Kbps",
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  Text(
+                    "Forwarded alerts: $forwardedAlertCount • Duplicates dropped: $duplicateAlertCount",
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 12),
             TextField(
