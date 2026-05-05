@@ -14,6 +14,7 @@ void main() {
     WidgetTester tester,
   ) async {
     await tester.pumpWidget(const PortonianApp());
+    await tester.pump();
 
     expect(find.text('PORTONIAN PUSH'), findsOneWidget);
     expect(find.text('ACTIVATE BEACON'), findsOneWidget);
@@ -22,5 +23,19 @@ void main() {
     expect(find.text('Alert Feed'), findsOneWidget);
     expect(find.text('Discovered Devices'), findsOneWidget);
     expect(find.text('Scan Log'), findsOneWidget);
+  });
+
+  testWidgets('shows hybrid and evaluation sections by default', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const PortonianApp());
+    await tester.pump();
+
+    expect(find.text('Hybrid Status'), findsOneWidget);
+    expect(find.text('Evaluation Metrics'), findsOneWidget);
+    expect(find.text('HYBRID: CHECKING...'), findsOneWidget);
+    expect(find.text('Cloud link: unavailable'), findsOneWidget);
+    expect(find.text('MANET failover: standby'), findsOneWidget);
+    expect(find.text('Reset evaluation metrics'), findsOneWidget);
   });
 }

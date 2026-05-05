@@ -78,7 +78,7 @@ The key objectives of this project are:
 
 ## Evaluation & Testing
 
-The application will be tested using multiple physical devices under different conditions, including:
+The application was evaluated using multiple physical devices under different conditions, including:
 
 - Internet connectivity enabled and disabled
 - Stationary and moving nodes (“human bridge” scenario)
@@ -91,6 +91,12 @@ The following performance aspects are evaluated:
 - Network stability under node mobility
 
 Evidence (screenshots, logs, recordings) is stored in the `/evidence` directory.
+
+## Conclusion
+
+Portonian Push demonstrates the core feasibility of a hybrid emergency alerting approach: when internet connectivity is available, the app can remain cloud-ready, and when it is unavailable, nearby devices can relay alerts across a MANET path. The prototype successfully shows peer discovery, alert forwarding, hybrid status reporting, and measurable network behaviour on physical Android devices.
+
+The main limitation observed during testing is reliability under repeated use. In particular, while the first delivery path worked well, some later messages showed inconsistent forwarding, especially to the final device in the chain. That makes this a strong proof of concept, but not yet a production-ready emergency notification system.
 
 ---
 
@@ -132,8 +138,7 @@ Future work could explore:
 
 This repository represents my **own individual work** for the F20MX coursework.
 
-Generative AI tools were used to support learning, planning, and high‑level structuring activities.  
-All code, implementation decisions, analysis, and written content are my own.
+Generative AI tools were used to support learning, planning, and high-level structuring activities. All code, implementation decisions, analysis, and written content were completed by me.
 
 ---
 
